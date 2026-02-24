@@ -131,8 +131,9 @@ class LearnablePrompts(nn.Module):
         if return_prompts_only:
             return prompts
         
-        # Concatenate prompts to the front of the token sequence
-        x = torch.cat([prompts, x], dim=1)
+        # Input should be 3D: (batch, seq_len, dim)
+        # Concatenate prompts to the front of the token sequence along dimension 1
+        x = torch.cat([prompts, x], dim=1)  # (batch, num_prompts + seq_len, dim)
         
         return x
     
