@@ -195,22 +195,37 @@ class AdapterConfig:
 
 
 def create_adapters_for_sam(
-    config: AdapterConfig,
-    sam_encoder: nn.Module
-) -> Dict[str, nn.Module]:
+    sam_encoder: nn.Module,
+    adapter_layers: List[int] = None,
+    adapter_positions: List[str] = None,
+    bottleneck_ratio: float = 0.25,
+    dropout: float = 0.1,
+    activation: str = "gelu"
+) -> nn.ModuleDict:
     """
     Create and insert adapters into a SAM encoder.
     
     Args:
-        config: AdapterConfig object
         sam_encoder: SAM image encoder module
+        adapter_layers: List of layer indices to add adapters to
+        adapter_positions: Where to add adapters ['attn', 'mlp'] or both
+        bottleneck_ratio: Bottleneck dimension ratio
+        dropout: Dropout probability
+        activation: Activation function
     
     Returns:
-        Dictionary mapping layer names to adapter modules
+        ModuleDict mapping layer names to adapter modules
     """
+    if adapter_layers is None:
+        adapter_layers = [8, 9, 10, 11]
+    
+    if adapter_positions is None:
+        adapter_positions = ['attn', 'mlp']
+    
+    hidden_dim = sam_encoder.pos_embed.shape[-1]
     adapters = {}
     
-    for layer_idx in config.adapter_layers:
+    for layer_idx in adapter_layers:
         if layer_idx >= len(sam_encoder.blocks):
             logger.warning(f"Layer {layer_idx} out of range, skipping")
             continue
@@ -218,25 +233,25 @@ def create_adapters_for_sam(
         block = sam_encoder.blocks[layer_idx]
         
         # Add adapter after attention
-        if 'attn' in config.adapter_positions:
+        if 'attn' in adapter_positions:
             adapter_attn = BottleneckAdapter(
-                hidden_dim=config.hidden_dim,
-                bottleneck_ratio=config.bottleneck_ratio,
-                dropout=config.dropout,
-                activation=config.activation
+                hidden_dim=hidden_dim,
+                bottleneck_ratio=bottleneck_ratio,
+                dropout=dropout,
+                activation=activation
             )
-            # Store adapter in the block (will be patched in forward)
+            # Store adapter in the block (will be used in patched forward)
             block.attn_adapter = adapter_attn
             adapters[f'layer{layer_idx}_attn'] = adapter_attn
             logger.info(f"Added attention adapter to layer {layer_idx}")
         
         # Add adapter after MLP
-        if 'mlp' in config.adapter_positions:
+        if 'mlp' in adapter_positions:
             adapter_mlp = BottleneckAdapter(
-                hidden_dim=config.hidden_dim,
-                bottleneck_ratio=config.bottleneck_ratio,
-                dropout=config.dropout,
-                activation=config.activation
+                hidden_dim=hidden_dim,
+                bottleneck_ratio=bottleneck_ratio,
+                dropout=dropout,
+                activation=activation
             )
             # Store adapter in the block
             block.mlp_adapter = adapter_mlp
@@ -244,111 +259,10 @@ def create_adapters_for_sam(
             logger.info(f"Added MLP adapter to layer {layer_idx}")
     
     logger.info(f"Created {len(adapters)} adapter modules")
-    logger.info(f"Total adapter parameters: ~{config.get_parameter_count():,}")
     
-    return adapters
-
-
-# Patch the transformer block forward to use adapters
-def patched_block_forward(self, x):
-    """
-    Patched forward function for transformer blocks with adapters.
-    To use this, you would replace the original forward method.
-    """
-    # Original attention
-    shortcut = x
-    x = self.norm1(x)
-    
-    # Window attention if applicable
-    if self.window_size:
-        H, W = self.input_resolution
-        x, H, W = self.window_partition(x, H, W)
-    
-    x = self.attn(x)
-    
-    if self.window_size:
-        x = self.window_unpartition(x, H, W)
-    
-    x = shortcut + x
-    
-    # Apply attention adapter if exists
-    if hasattr(self, 'attn_adapter'):
-        x = self.attn_adapter(x)
-    
-    # Original MLP
-    shortcut = x
-    x = self.norm2(x)
-    x = self.mlp(x)
-    x = shortcut + x
-    
-    # Apply MLP adapter if exists
-    if hasattr(self, 'mlp_adapter'):
-        x = self.mlp_adapter(x)
-    
-    return x
-
-
-class AdapterSAMWrapper(nn.Module):
-    """
-    SAM encoder with adapter modules inserted.
-    This wraps the original SAM encoder and adds adapters for PEFT.
-    """
-    
-    def __init__(
-        self,
-        sam_encoder: nn.Module,
-        config: Optional[AdapterConfig] = None,
-        hidden_dim: int = 768
-    ):
-        super().__init__()
-        
-        self.encoder = sam_encoder
-        self.hidden_dim = hidden_dim
-        
-        if config is None:
-            config = AdapterConfig(hidden_dim=hidden_dim)
-        
-        self.config = config
-        
-        # Create and insert adapters
-        self.adapters = nn.ModuleDict(
-            create_adapters_for_sam(config, self.encoder)
-        )
-        
-        # Count parameters
-        self._log_parameter_counts()
-    
-    def _log_parameter_counts(self):
-        """Log parameter counts."""
-        encoder_params = sum(p.numel() for p in self.encoder.parameters())
-        adapter_params = sum(p.numel() for p in self.adapters.parameters())
-        
-        logger.info(f"Encoder parameters: {encoder_params:,}")
-        logger.info(f"Adapter parameters: {adapter_params:,}")
-        logger.info(f"Adapter percentage: {100 * adapter_params / encoder_params:.2f}%")
-    
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Forward pass through encoder with adapters.
-        Note: This requires patching the encoder blocks' forward methods.
-        """
-        return self.encoder(x)
-    
-    def get_trainable_parameters(self):
-        """Get trainable parameters (adapters only)."""
-        return self.adapters.parameters()
-    
-    def freeze_encoder(self):
-        """Freeze the base encoder."""
-        for param in self.encoder.parameters():
-            param.requires_grad = False
-        logger.info("Encoder frozen")
-    
-    def unfreeze_adapters(self):
-        """Unfreeze adapters for training."""
-        for param in self.adapters.parameters():
-            param.requires_grad = True
-        logger.info("Adapters unfrozen")
+    # Convert to ModuleDict
+    adapter_dict = nn.ModuleDict(adapters)
+    return adapter_dict
 
 
 def test_adapters():

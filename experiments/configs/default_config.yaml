@@ -1,25 +1,22 @@
 # Default configuration for PEFT-SAM training
 experiment_name: peft_sam_baseline
-dataset: isic  # Options: isic, busi
+dataset: isic
 data_root: data
-
-# Model settings
 sam_checkpoint: checkpoints/sam_vit_b_01ec64.pth
 model_type: vit_b
-use_adapters: true
-use_prompts: true
 freeze_encoder: true
+
+# Prompt settings
+use_prompts: true  # Always true in current implementation
+
+# Adapter settings
+use_adapters: true
+adapter_layers: [8, 9, 10, 11]  # Last 4 layers (adjust to control parameter count)
 
 # Training settings
 batch_size: 4
 num_epochs: 50
 learning_rate: 0.0001
 weight_decay: 0.01
-
-# Data settings
 target_size: [1024, 1024]
 num_workers: 2
-
-# Logging
-use_wandb: false
-resume_from: null
