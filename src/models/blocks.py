@@ -1,6 +1,7 @@
 """
 SAM-Compatible Additive Deep Prompt Encoder with Adapters
 Handles dynamic input resolution via positional embedding interpolation.
+All components are optional for clean ablation studies.
 """
 
 import torch
@@ -16,38 +17,52 @@ logger = logging.getLogger(__name__)
 class PromptedSAMEncoder(nn.Module):
     """
     SAM Image Encoder with:
-    - Layer-wise additive prompts
+    - Optional layer-wise additive prompts
     - Optional bottleneck adapters
     Fully compatible with SAM ViT architecture.
+    All components can be disabled for clean ablation.
     """
 
-    def __init__(self, sam_encoder: nn.Module, use_adapters: bool = True, adapter_layers: list = None):
+    def __init__(
+        self, 
+        sam_encoder: nn.Module, 
+        use_prompts: bool = True, 
+        use_adapters: bool = True, 
+        adapter_layers: list = None
+    ):
         super().__init__()
 
+        # Always copy these components (they're part of base encoder)
         self.patch_embed = sam_encoder.patch_embed
         self.blocks = sam_encoder.blocks
         self.pos_embed = sam_encoder.pos_embed
         self.neck = sam_encoder.neck
+        
+        # Store configuration
+        self.use_prompts = use_prompts
         self.use_adapters = use_adapters
 
         self.embed_dim = sam_encoder.pos_embed.shape[-1]
         self.num_layers = len(self.blocks)
 
         # ===============================
-        # 1. Deep Additive Prompts
+        # 1. Deep Additive Prompts (Optional)
         # ===============================
-        self.prompt_embeddings = nn.Parameter(
-            torch.randn(self.num_layers, 1, 1, 1, self.embed_dim) * 0.02
-        )
-        logger.info(f"Initialized {self.num_layers} layers of additive prompts")
-        logger.info(f"  Prompt parameters: {self.prompt_embeddings.numel():,}")
+        if use_prompts:
+            self.prompt_embeddings = nn.Parameter(
+                torch.randn(self.num_layers, 1, 1, 1, self.embed_dim) * 0.02
+            )
+            logger.info(f"Initialized {self.num_layers} layers of additive prompts")
+            logger.info(f"  Prompt parameters: {self.prompt_embeddings.numel():,}")
+        else:
+            self.prompt_embeddings = None
+            logger.info("Prompts disabled")
 
         # ===============================
         # 2. Bottleneck Adapters (Optional)
         # ===============================
         if use_adapters:
             if adapter_layers is None:
-                # Default: adapters in last 4 layers (efficient)
                 adapter_layers = [8, 9, 10, 11]
             
             # Insert adapters into SAM encoder
@@ -61,21 +76,12 @@ class PromptedSAMEncoder(nn.Module):
             adapter_params = sum(p.numel() for p in self.adapters.parameters())
             logger.info(f"Initialized adapters in layers {adapter_layers}")
             logger.info(f"  Adapter parameters: {adapter_params:,}")
-            
-            # Freeze everything except prompts and adapters
-            for name, param in self.named_parameters():
-                if "prompt_embeddings" not in name and "adapter" not in name:
-                    param.requires_grad = False
         else:
             self.adapters = None
-            # Freeze everything except prompts
-            for name, param in self.named_parameters():
-                if "prompt_embeddings" not in name:
-                    param.requires_grad = False
+            logger.info("Adapters disabled")
 
-        # Log trainable parameter count
-        trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
-        logger.info(f"Total trainable parameters in encoder: {trainable:,}")
+        # Freeze base encoder (handled in train.py, not here)
+        # Only prompts and adapters should be trainable when enabled
 
     def interpolate_pos_encoding(self, x, pos_embed):
         """
@@ -100,9 +106,7 @@ class PromptedSAMEncoder(nn.Module):
 
     def forward(self, x):
         """
-        Forward pass with:
-        - Additive prompts before each block
-        - Adapters inside blocks (if enabled)
+        Forward pass with optional prompts and adapters.
         """
         # Patch embedding
         x = self.patch_embed(x)
@@ -115,12 +119,13 @@ class PromptedSAMEncoder(nn.Module):
         pos_embed = self.interpolate_pos_encoding(x, self.pos_embed)
         x = x + pos_embed
 
-        # Transformer blocks with prompts and adapters
+        # Transformer blocks with optional prompts and adapters
         for i, block in enumerate(self.blocks):
-            # Add prompt bias before block
-            x = x + self.prompt_embeddings[i]
+            # Add prompt bias before block if enabled
+            if self.use_prompts and self.prompt_embeddings is not None:
+                x = x + self.prompt_embeddings[i]
             
-            # Apply original block (adapters are inside via patching)
+            # Apply original block (adapters are inside via patching if enabled)
             x = block(x)
 
         # Back to (B, C, H, W) for decoder

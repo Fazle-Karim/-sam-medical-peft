@@ -1,6 +1,7 @@
 """
 Production-Ready PEFT-SAM Training Script
 SAM-compatible additive deep prompts with optional adapters
+Includes seed for reproducibility and proper ablation controls
 """
 
 import torch
@@ -8,6 +9,7 @@ import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
 import numpy as np
+import random
 from pathlib import Path
 import yaml
 import logging
@@ -23,10 +25,24 @@ logger = logging.getLogger(__name__)
 
 
 # ===============================
+# Reproducibility
+# ===============================
+
+def set_seed(seed):
+    """Set all random seeds for reproducibility."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    logger.info(f"Set seed to {seed}")
+
+
+# ===============================
 # Metrics
 # ===============================
 
 def dice_score(pred, target, eps=1e-6):
+    """Dice coefficient for segmentation evaluation."""
     pred = (pred > 0.5).float()
     intersection = (pred * target).sum(dim=(2, 3))
     union = pred.sum(dim=(2, 3)) + target.sum(dim=(2, 3))
@@ -34,6 +50,7 @@ def dice_score(pred, target, eps=1e-6):
 
 
 def iou_score(pred, target, eps=1e-6):
+    """Intersection over Union for segmentation evaluation."""
     pred = (pred > 0.5).float()
     intersection = (pred * target).sum(dim=(2, 3))
     union = (pred + target - pred * target).sum(dim=(2, 3))
@@ -45,6 +62,12 @@ def iou_score(pred, target, eps=1e-6):
 # ===============================
 
 class PEFT_SAM(nn.Module):
+    """
+    Parameter-Efficient Fine-Tuning SAM with:
+    - Optional additive deep prompts (per layer)
+    - Optional bottleneck adapters
+    All components can be disabled for clean ablation.
+    """
 
     def __init__(self, config, device):
         super().__init__()
@@ -57,26 +80,60 @@ class PEFT_SAM(nn.Module):
             checkpoint=config['sam_checkpoint']
         ).to(device)
 
-        # Freeze image encoder
+        # ===============================
+        # 1. FREEZE PROMPT ENCODER (if requested)
+        # ===============================
+        if config.get('freeze_prompt_encoder', False):
+            for p in self.sam.prompt_encoder.parameters():
+                p.requires_grad = False
+            logger.info("✅ Prompt encoder frozen")
+        else:
+            logger.info("⚠️ Prompt encoder trainable")
+
+        # ===============================
+        # 2. FREEZE IMAGE ENCODER (if requested)
+        # ===============================
         if config.get("freeze_encoder", True):
             for p in self.sam.image_encoder.parameters():
                 p.requires_grad = False
-            logger.info("Image encoder frozen")
+            logger.info("✅ Image encoder frozen")
+        else:
+            logger.info("⚠️ Image encoder trainable")
 
-        # Replace encoder with prompted + adapted version
+        # ===============================
+        # 3. FREEZE MASK DECODER (if requested)
+        # ===============================
+        if config.get('freeze_decoder', False):
+            for p in self.sam.mask_decoder.parameters():
+                p.requires_grad = False
+            logger.info("✅ Mask decoder frozen")
+        else:
+            logger.info("⚠️ Mask decoder trainable")
+
+        # ===============================
+        # 4. CREATE PROMPTED ENCODER (with optional components)
+        # ===============================
         self.prompted_encoder = PromptedSAMEncoder(
             self.sam.image_encoder,
+            use_prompts=config.get('use_prompts', True),
             use_adapters=config.get('use_adapters', True),
             adapter_layers=config.get('adapter_layers', [8, 9, 10, 11])
         )
 
-        # Mask decoder is always trainable
-        logger.info("Mask decoder is trainable")
+        # ===============================
+        # 5. ULTIMATE FREEZE - Force all prompt encoder parameters
+        # ===============================
+        if config.get('freeze_prompt_encoder', False):
+            for name, p in self.named_parameters():
+                if 'prompt_encoder' in name:
+                    p.requires_grad = False
+            logger.info("✅ Force-froze all prompt encoder parameters")
 
         self.to(device)
         self._log_params()
 
     def _log_params(self):
+        """Log detailed parameter counts."""
         total = sum(p.numel() for p in self.parameters())
         trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
         
@@ -87,12 +144,13 @@ class PEFT_SAM(nn.Module):
         logger.info(f"  Trainable parameters: {trainable:,}")
         logger.info(f"  Trainable percentage: {100 * trainable / total:.2f}%")
         
-        # Prompt parameters
-        prompt_params = self.prompted_encoder.prompt_embeddings.numel()
-        logger.info(f"  Prompt parameters: {prompt_params:,} ({100 * prompt_params / total:.2f}%)")
+        # Prompt parameters (if enabled)
+        if self.config.get('use_prompts', False) and hasattr(self.prompted_encoder, 'prompt_embeddings') and self.prompted_encoder.prompt_embeddings is not None:
+            prompt_params = self.prompted_encoder.prompt_embeddings.numel()
+            logger.info(f"  Prompt parameters: {prompt_params:,} ({100 * prompt_params / total:.2f}%)")
         
         # Adapter parameters (if enabled)
-        if self.config.get('use_adapters', False):
+        if self.config.get('use_adapters', False) and hasattr(self.prompted_encoder, 'adapters') and self.prompted_encoder.adapters is not None:
             adapter_params = sum(p.numel() for p in self.prompted_encoder.adapters.parameters())
             logger.info(f"  Adapter parameters: {adapter_params:,} ({100 * adapter_params / total:.2f}%)")
         
@@ -102,13 +160,16 @@ class PEFT_SAM(nn.Module):
         logger.info("=" * 60)
 
     def forward(self, images):
+        """
+        Forward pass with optional prompts and adapters.
+        """
         images = images.to(self.device)
 
-        # Get image embeddings with prompts and adapters
+        # Get image embeddings with prompts and adapters (if enabled)
         image_embeddings = self.prompted_encoder(images)
         target_size = image_embeddings.shape[-2:]
 
-        # Get dense positional embeddings
+        # Get dense positional embeddings from prompt encoder
         image_pe = self.sam.prompt_encoder.get_dense_pe()
 
         # Interpolate image_pe if needed
@@ -157,6 +218,7 @@ class PEFT_SAM(nn.Module):
         return masks
 
     def trainable_parameters(self):
+        """Get trainable parameters for optimizer."""
         return [p for p in self.parameters() if p.requires_grad]
 
 
@@ -165,6 +227,7 @@ class PEFT_SAM(nn.Module):
 # ===============================
 
 class Trainer:
+    """Trainer for PEFT-SAM with mixed precision and early stopping."""
 
     def __init__(self, model, train_loader, val_loader, config, exp_dir):
         self.model = model
@@ -175,25 +238,38 @@ class Trainer:
         self.exp_dir = exp_dir
         exp_dir.mkdir(parents=True, exist_ok=True)
 
-        self.optimizer = optim.AdamW(
-            model.trainable_parameters(),
-            lr=config['learning_rate'],
-            weight_decay=config.get('weight_decay', 0.01)
-        )
+        # Only create optimizer if we're training
+        if config.get('num_epochs', 0) > 0:
+            self.optimizer = optim.AdamW(
+                model.trainable_parameters(),
+                lr=config['learning_rate'],
+                weight_decay=config.get('weight_decay', 0.01)
+            )
 
-        self.scheduler = optim.lr_scheduler.CosineAnnealingLR(
-            self.optimizer,
-            T_max=config['num_epochs']
-        )
+            self.scheduler = optim.lr_scheduler.CosineAnnealingLR(
+                self.optimizer,
+                T_max=config['num_epochs']
+            )
 
-        self.scaler = torch.cuda.amp.GradScaler(enabled=torch.cuda.is_available())
+            self.scaler = torch.cuda.amp.GradScaler(enabled=torch.cuda.is_available())
+        else:
+            self.optimizer = None
+            self.scheduler = None
+            self.scaler = None
+            logger.info("Zero-shot mode: no training will be performed")
 
+        # Training state
         self.best_dice = 0
         self.early_counter = 0
 
+        # Loss functions
         self.bce = nn.BCEWithLogitsLoss()
 
     def train_epoch(self):
+        """Train for one epoch."""
+        if self.optimizer is None:
+            return 0.0
+            
         self.model.train()
         total_loss = 0
 
@@ -222,6 +298,7 @@ class Trainer:
         return total_loss / len(self.train_loader)
 
     def validate(self):
+        """Validate the model."""
         self.model.eval()
         dices, ious = [], []
 
@@ -237,6 +314,23 @@ class Trainer:
         return np.mean(dices) * 100, np.mean(ious) * 100
 
     def train(self):
+        """Main training loop with early stopping."""
+        # For zero-shot, just validate and return
+        if self.config.get('num_epochs', 0) == 0:
+            logger.info("Running zero-shot evaluation...")
+            val_dice, val_iou = self.validate()
+            logger.info(f"Zero-shot Dice: {val_dice:.2f}%, IoU: {val_iou:.2f}%")
+            
+            # Save results
+            results = {
+                'dice': val_dice,
+                'iou': val_iou,
+                'config': self.config
+            }
+            torch.save(results, self.exp_dir / "zero_shot_results.pth")
+            return
+
+        # Training loop
         for epoch in range(self.config['num_epochs']):
             train_loss = self.train_epoch()
             val_dice, val_iou = self.validate()
@@ -276,12 +370,21 @@ class Trainer:
 # ===============================
 
 def main(config_path):
+    """Main training function."""
+    
+    # Load configuration
     with open(config_path) as f:
         config = yaml.safe_load(f)
 
+    # Set seed for reproducibility
+    if 'seed' in config:
+        set_seed(config['seed'])
+
+    # Set device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info(f"Using device: {device}")
 
+    # Create dataloaders
     dataloaders = create_dataloaders(
         root_dir=config['data_root'],
         batch_size=config['batch_size'],
@@ -292,12 +395,24 @@ def main(config_path):
     train_loader = dataloaders[config['dataset']]['train']
     val_loader = dataloaders[config['dataset']]['val']
 
+    # Create experiment directory
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    exp_name = f"{config['experiment_name']}_{timestamp}"
+    exp_name = f"{config['experiment_name']}_{config['seed']}_{timestamp}"
     exp_dir = Path("results") / exp_name
 
+    # Create model
     model = PEFT_SAM(config, device)
-    trainer = Trainer(model, train_loader, val_loader, config, exp_dir)
+
+    # Create trainer
+    trainer = Trainer(
+        model=model,
+        train_loader=train_loader,
+        val_loader=val_loader,
+        config=config,
+        exp_dir=exp_dir
+    )
+
+    # Train or evaluate
     trainer.train()
 
 

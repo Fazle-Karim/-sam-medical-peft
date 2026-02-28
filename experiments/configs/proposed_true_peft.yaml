@@ -1,0 +1,23 @@
+# True PEFT: Frozen mask decoder + prompts + adapters
+experiment_name: proposed_true_peft
+dataset: isic
+data_root: data
+sam_checkpoint: checkpoints/sam_vit_b_01ec64.pth
+model_type: vit_b
+seed: 42
+
+# Core settings - EVERYTHING FROZEN EXCEPT PROMPTS+ADAPTERS
+freeze_encoder: true
+freeze_decoder: true
+freeze_prompt_encoder: true  # Add this!
+use_prompts: true
+use_adapters: true
+adapter_layers: [8, 9, 10, 11]
+
+# Training
+batch_size: 4
+num_epochs: 50
+learning_rate: 1e-4
+weight_decay: 0.01
+target_size: [1024, 1024]
+num_workers: 4

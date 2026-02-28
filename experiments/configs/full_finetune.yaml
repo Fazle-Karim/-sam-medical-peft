@@ -1,0 +1,21 @@
+# Full fine-tuning baseline
+experiment_name: full_finetune
+dataset: isic
+data_root: data
+sam_checkpoint: checkpoints/sam_vit_b_01ec64.pth
+model_type: vit_b
+seed: 42
+
+# Core settings - everything trainable
+freeze_encoder: false
+freeze_decoder: false
+use_prompts: false
+use_adapters: false
+
+# Training
+batch_size: 2  # Smaller due to memory
+num_epochs: 50
+learning_rate: 1e-5  # Lower for full fine-tuning
+weight_decay: 0.01
+target_size: [1024, 1024]
+num_workers: 4
